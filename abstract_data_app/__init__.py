@@ -78,7 +78,7 @@ Programmatic tool inspection
 - ``app.get_mcp_spec(name, MCPToolType.UPSERT)`` — spec for one tool variant
 """
 
-from .app import App, MCPToolType, init
+from .app import App, MCPToolType, get_mcp_spec, init
 from .backend import (
     DataBackend,
     LocalSqliteDataBackend,
@@ -92,8 +92,9 @@ __all__ = [
     # Factory + App
     "init",
     "App",
-    # MCP tool type enum
+    # MCP tool type enum + standalone spec lookup
     "MCPToolType",
+    "get_mcp_spec",
     # Config
     "Config",
     # Operation base

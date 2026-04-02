@@ -249,28 +249,51 @@ class App:
         """
         return list(self._mcp_tools)
 
-    def get_mcp_spec(self, type_name: str, tool_type: MCPToolType) -> dict:
+    def get_mcp_spec(
+        self,
+        *,
+        data_type: Optional[type] = None,
+        tool_type: Optional[MCPToolType] = None,
+        operation=None,
+    ) -> dict:
         """
-        Return the MCP tool spec for one auto-generated data-type tool.
+        Return the MCP tool spec for a data-type tool or an operation.
+
+        Pass either ``operation`` alone, or both ``data_type`` and ``tool_type``.
 
         Args:
-            type_name: The ``__name__`` of a registered dataclass
-                       (e.g. ``Product.__name__`` or ``"Product"``).
+            data_type: The registered dataclass (e.g. ``Product``).
             tool_type: A :class:`MCPToolType` value selecting which of the
                        five auto-generated tools to retrieve.
+            operation: An :class:`~abstract_data_app.Operation` subclass (or
+                       instance).  When provided, returns its ``TOOL_SPEC``
+                       directly.  ``data_type`` and ``tool_type`` are ignored.
 
         Returns:
             The tool spec dict (``name``, ``description``, ``inputSchema``).
+            For data-type tools, this is the pre-built spec that includes any
+            field descriptions supplied via ``MCP_SPEC``.
 
         Raises:
-            KeyError: If no matching tool is found.
+            KeyError: If no matching data-type tool is found.
+            ValueError: If neither ``operation`` nor both ``data_type`` +
+                        ``tool_type`` are provided.
 
-        Example::
+        Examples::
 
-            spec = app.get_mcp_spec(Product.__name__, MCPToolType.UPSERT)
-            print(spec["inputSchema"]["properties"]["data"]["properties"])
+            # Data-type tool (includes MCP_SPEC descriptions if registered)
+            spec = app.get_mcp_spec(data_type=Product, tool_type=MCPToolType.UPSERT)
+
+            # Operation tool (passthrough to TOOL_SPEC)
+            spec = app.get_mcp_spec(operation=ClaimOp)
         """
-        tool_name = f"{type_name}_{tool_type.value}"
+        if operation is not None:
+            return operation.TOOL_SPEC
+        if data_type is None or tool_type is None:
+            raise ValueError(
+                "Provide either `operation=` or both `data_type=` and `tool_type=`"
+            )
+        tool_name = f"{data_type.__name__}_{tool_type.value}"
         for tool in self._mcp_tools:
             if tool["name"] == tool_name:
                 return tool
@@ -555,96 +578,12 @@ class App:
 
     def _build_mcp_tools(self) -> list[dict]:
         tools: list[dict] = []
-
         for type_name, data_type in self.data_types.items():
-            raw_schema = dataclass_to_json_schema(data_type)
             field_specs = self._mcp_field_specs.get(type_name, {})
-            schema = (
-                _apply_field_descriptions(raw_schema, field_specs)
-                if field_specs
-                else raw_schema
-            )
-
-            tools.append({
-                "name": f"{type_name}_upsert",
-                "description": f"Insert or update a {type_name} item by key.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string", "description": "Unique item key"},
-                        "data": {**schema, "description": f"{type_name} payload"},
-                    },
-                    "required": ["key", "data"],
-                },
-            })
-
-            tools.append({
-                "name": f"{type_name}_delete",
-                "description": f"Delete a {type_name} item by key.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string"},
-                    },
-                    "required": ["key"],
-                },
-            })
-
-            tools.append({
-                "name": f"{type_name}_get",
-                "description": f"Retrieve a {type_name} item by key.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string"},
-                    },
-                    "required": ["key"],
-                },
-            })
-
-            tools.append({
-                "name": f"{type_name}_list",
-                "description": (
-                    f"List all {type_name} items. "
-                    "Optionally filter results using a jq expression applied to the "
-                    "array of {\"key\": ..., \"data\": {...}} objects."
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "jq_filter": {
-                            "type": "string",
-                            "description": (
-                                "jq expression, e.g. '.[] | select(.data.active == true)'"
-                            ),
-                        },
-                    },
-                },
-            })
-
-            tools.append({
-                "name": f"{type_name}_validate",
-                "description": (
-                    f"Validate a JSON object as a {type_name}. "
-                    "Returns a list of errors (empty if valid). "
-                    "Each field is checked in parallel; if all pass, a dry-run "
-                    "upsert is attempted against all configured backends."
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "data": {
-                            **schema,
-                            "description": f"The {type_name} payload to validate",
-                        },
-                    },
-                    "required": ["data"],
-                },
-            })
-
-        for op_name, op in self.operations.items():
+            for tool_type in MCPToolType:
+                tools.append(_compute_data_type_tool_spec(data_type, tool_type, field_specs))
+        for op in self.operations.values():
             tools.append(op.TOOL_SPEC)
-
         return tools
 
     # ------------------------------------------------------------------
@@ -742,6 +681,96 @@ def _require(args: dict, *keys: str) -> None:
         raise _McpInvalidParams(f"Missing required argument(s): {missing}")
 
 
+def _compute_data_type_tool_spec(
+    data_type: type,
+    tool_type: MCPToolType,
+    field_specs: dict,
+) -> dict:
+    """
+    Build the MCP tool spec dict for one (data_type, tool_type) combination.
+
+    *field_specs* maps field names to ``{"description": "..."}`` dicts
+    (from ``MCP_SPEC``).  Pass an empty dict for no descriptions.
+    """
+    type_name = data_type.__name__
+    raw_schema = dataclass_to_json_schema(data_type)
+    schema = _apply_field_descriptions(raw_schema, field_specs) if field_specs else raw_schema
+
+    if tool_type == MCPToolType.UPSERT:
+        return {
+            "name": f"{type_name}_upsert",
+            "description": f"Insert or update a {type_name} item by key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Unique item key"},
+                    "data": {**schema, "description": f"{type_name} payload"},
+                },
+                "required": ["key", "data"],
+            },
+        }
+    if tool_type == MCPToolType.DELETE:
+        return {
+            "name": f"{type_name}_delete",
+            "description": f"Delete a {type_name} item by key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+            },
+        }
+    if tool_type == MCPToolType.GET:
+        return {
+            "name": f"{type_name}_get",
+            "description": f"Retrieve a {type_name} item by key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+            },
+        }
+    if tool_type == MCPToolType.LIST:
+        return {
+            "name": f"{type_name}_list",
+            "description": (
+                f"List all {type_name} items. "
+                "Optionally filter results using a jq expression applied to the "
+                'array of {"key": ..., "data": {...}} objects.'
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "jq_filter": {
+                        "type": "string",
+                        "description": (
+                            "jq expression, e.g. '.[] | select(.data.active == true)'"
+                        ),
+                    },
+                },
+            },
+        }
+    # MCPToolType.VALIDATE
+    return {
+        "name": f"{type_name}_validate",
+        "description": (
+            f"Validate a JSON object as a {type_name}. "
+            "Returns a list of errors (empty if valid). "
+            "Each field is checked in parallel; if all pass, a dry-run "
+            "upsert is attempted against all configured backends."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    **schema,
+                    "description": f"The {type_name} payload to validate",
+                },
+            },
+            "required": ["data"],
+        },
+    }
+
+
 def _assert_mcp_spec_matches(data_type: type, mcp_spec: dict) -> None:
     """
     Assert that every key in *mcp_spec* is a valid field name on *data_type*.
@@ -815,3 +844,53 @@ def init(
         data_backends=data_backend,
         config=config or Config(),
     )
+
+
+def get_mcp_spec(
+    *,
+    data_type: Optional[type] = None,
+    tool_type: Optional[MCPToolType] = None,
+    operation=None,
+) -> dict:
+    """
+    Compute the MCP tool spec for a data-type tool or an operation.
+
+    This is a **module-level** function that works without an :class:`App`
+    instance.  It produces the same result as :meth:`App.get_mcp_spec` when
+    no ``MCP_SPEC`` field descriptions have been registered on the app.
+
+    Pass either ``operation`` alone, or both ``data_type`` and ``tool_type``.
+
+    Args:
+        data_type: A Python ``@dataclass`` class (e.g. ``Product``).
+        tool_type: A :class:`MCPToolType` value selecting which of the five
+                   auto-generated tools to compute.
+        operation: An :class:`~abstract_data_app.Operation` subclass (or
+                   instance).  Returns its ``TOOL_SPEC`` directly; ``data_type``
+                   and ``tool_type`` are ignored.
+
+    Returns:
+        The tool spec dict (``name``, ``description``, ``inputSchema``).
+
+    Raises:
+        ValueError: If neither ``operation`` nor both ``data_type`` +
+                    ``tool_type`` are provided.
+
+    Examples::
+
+        # Compute a data-type tool spec without an app instance
+        spec = abstract_data_app.get_mcp_spec(
+            data_type=Product,
+            tool_type=MCPToolType.UPSERT,
+        )
+
+        # Get an operation's TOOL_SPEC
+        spec = abstract_data_app.get_mcp_spec(operation=ClaimOp)
+    """
+    if operation is not None:
+        return operation.TOOL_SPEC
+    if data_type is None or tool_type is None:
+        raise ValueError(
+            "Provide either `operation=` or both `data_type=` and `tool_type=`"
+        )
+    return _compute_data_type_tool_spec(data_type, tool_type, field_specs={})
