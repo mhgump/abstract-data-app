@@ -51,10 +51,10 @@ class Book:
 def client() -> Client:
     port = find_free_port()
     app = abstract_data_app.init(
-        data_backend=[LocalSqliteDataBackend(":memory:")],
-        data_types=[Book],
+        data_backend=LocalSqliteDataBackend(":memory:"),
         config=Config(host="127.0.0.1", port=port, print_errors=True),
     )
+    app.add_data_type(Book)
     start_server(app, port)
     return Client(f"http://127.0.0.1:{port}")
 

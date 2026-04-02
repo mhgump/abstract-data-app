@@ -14,6 +14,7 @@ Quickstart::
         Operation,
         LocalSqliteDataBackend,
         Config,
+        MCPToolType,
     )
 
 
@@ -40,10 +41,10 @@ Quickstart::
 
 
     app = abstract_data_app.init(
-        data_backend=[LocalSqliteDataBackend("widgets.db")],
-        data_types=[Widget],
-        operations=[EchoOp],
+        data_backend=LocalSqliteDataBackend("widgets.db"),
     )
+    app.add_data_type(Widget, MCP_SPEC={"name": {"description": "Widget display name"}})
+    app.add_operation(EchoOp)
     app.serve_forever()
 
 HTTP routes (per data type)
@@ -70,9 +71,14 @@ MCP tools (per data type)
 MCP tools (per operation)
 -------------------------
 Each ``Operation.TOOL_SPEC["name"]`` is exposed as an MCP tool.
+
+Programmatic tool inspection
+-----------------------------
+- ``app.list_mcp_tools()``                      — all registered tool specs
+- ``app.get_mcp_spec(name, MCPToolType.UPSERT)`` — spec for one tool variant
 """
 
-from .app import App, init
+from .app import App, MCPToolType, init
 from .backend import (
     DataBackend,
     LocalSqliteDataBackend,
@@ -86,6 +92,8 @@ __all__ = [
     # Factory + App
     "init",
     "App",
+    # MCP tool type enum
+    "MCPToolType",
     # Config
     "Config",
     # Operation base

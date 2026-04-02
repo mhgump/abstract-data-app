@@ -12,18 +12,20 @@ You declare your data shapes and custom logic. The framework generates the serve
 2. [Quickstart](#quickstart)
 3. [Core concepts](#core-concepts)
 4. [Defining data types](#defining-data-types)
-5. [Defining operations](#defining-operations)
-6. [HTTP API reference](#http-api-reference)
-7. [jq filtering](#jq-filtering)
-8. [MCP server reference](#mcp-server-reference)
-9. [Validation tool](#validation-tool)
-10. [Data backends](#data-backends)
-11. [Multiple backends](#multiple-backends)
-12. [Writing a custom backend](#writing-a-custom-backend)
-13. [Configuration reference](#configuration-reference)
-14. [Concurrency and thread safety](#concurrency-and-thread-safety)
-15. [Error handling and reliability](#error-handling-and-reliability)
-16. [Running tests](#running-tests)
+5. [Annotating MCP fields with MCP_SPEC](#annotating-mcp-fields-with-mcp_spec)
+6. [Defining operations](#defining-operations)
+7. [HTTP API reference](#http-api-reference)
+8. [jq filtering](#jq-filtering)
+9. [MCP server reference](#mcp-server-reference)
+10. [Programmatic tool inspection](#programmatic-tool-inspection)
+11. [Validation tool](#validation-tool)
+12. [Data backends](#data-backends)
+13. [Multiple backends](#multiple-backends)
+14. [Writing a custom backend](#writing-a-custom-backend)
+15. [Configuration reference](#configuration-reference)
+16. [Concurrency and thread safety](#concurrency-and-thread-safety)
+17. [Error handling and reliability](#error-handling-and-reliability)
+18. [Running tests](#running-tests)
 
 ---
 
@@ -96,9 +98,16 @@ class DiscountOp(Operation):
 
 app = abstract_data_app.init(
     data_backend=LocalSqliteDataBackend("store.db"),
-    data_types=[Product],
-    operations=[DiscountOp],
 )
+app.add_data_type(
+    Product,
+    MCP_SPEC={
+        "name":     {"description": "Display name of the product"},
+        "price":    {"description": "Price in USD"},
+        "in_stock": {"description": "Whether the item is available"},
+    },
+)
+app.add_operation(DiscountOp)
 app.serve_forever()
 ```
 
@@ -117,13 +126,20 @@ Once running, the server exposes:
 | **Key** | A user-provided string that uniquely identifies one instance of a data type. Keys are not part of the dataclass itself; they are supplied separately in the URL or MCP tool call. |
 | **Operation** | A subclass of `Operation` with a `TOOL_SPEC` dict and a `call()` method. Exposed only as an MCP tool, not as an HTTP route. |
 | **Backend** | A storage implementation (`LocalSqliteDataBackend`, `PostgresDataBackend`, or `RedisDataBackend`). Multiple backends can be used simultaneously; all writes are fanned out to every backend. |
-| **App** | The assembled server object, obtained from `abstract_data_app.init(...)`. Call `.serve_forever()` to start it. |
+| **App** | The assembled server object, obtained from `abstract_data_app.init(...)`. Call `add_data_type()` and `add_operation()` to register types and operations, then `.serve_forever()` to start it. |
+| **MCP_SPEC** | An optional dict passed to `add_data_type()` that maps field names to `{"description": "..."}` entries, enriching the auto-generated MCP tool schemas with human-readable field descriptions. |
 
 ---
 
 ## Defining data types
 
-Any `@dataclass` class can be passed as a data type. The framework reads its annotations at startup to generate JSON Schemas for MCP tools and to drive the validation tool.
+Register a `@dataclass` with `app.add_data_type()`. The framework reads its annotations to generate JSON Schemas for MCP tools and to drive the validation tool. Call `add_data_type` once per type, before starting the server.
+
+```python
+app.add_data_type(Product)
+```
+
+See [Annotating MCP fields with MCP_SPEC](#annotating-mcp-fields-with-mcp_spec) to enrich the generated schemas with field descriptions.
 
 ### Supported field types
 
@@ -179,9 +195,47 @@ class Config:
 
 ---
 
+## Annotating MCP fields with MCP_SPEC
+
+Pass an optional `MCP_SPEC` dict to `add_data_type` to attach human-readable descriptions to the fields of the auto-generated MCP tool schemas.
+
+```python
+app.add_data_type(
+    Product,
+    MCP_SPEC={
+        "name":     {"description": "Display name shown to customers"},
+        "price":    {"description": "Unit price in USD"},
+        "in_stock": {"description": "Set to false when inventory is zero"},
+        # "tags" omitted — will have no description in the generated schema
+    },
+)
+```
+
+### Rules
+
+- Every key in `MCP_SPEC` must be a field name on the dataclass. Passing an unknown key raises `ValueError` immediately.
+- Fields omitted from `MCP_SPEC` are still included in the schema; they just have no description.
+- Descriptions are applied to the `data` parameter of both the `_upsert` and `_validate` tool schemas.
+
+### Inspecting the result
+
+Use `get_mcp_spec` to retrieve the generated spec and confirm the descriptions:
+
+```python
+from abstract_data_app import MCPToolType
+
+spec = app.get_mcp_spec(Product.__name__, MCPToolType.UPSERT)
+props = spec["inputSchema"]["properties"]["data"]["properties"]
+print(props["name"]["description"])   # "Display name shown to customers"
+print(props["price"]["description"])  # "Unit price in USD"
+print("description" in props["tags"]) # False — omitted from MCP_SPEC
+```
+
+---
+
 ## Defining operations
 
-An operation is any subclass of `abstract_data_app.Operation` that:
+Register an operation with `app.add_operation()`. An operation is any subclass of `abstract_data_app.Operation` that:
 
 1. Sets the `TOOL_SPEC` class variable to a valid MCP tool definition dict.
 2. Implements the `call(self, tool_input)` method.
@@ -245,11 +299,9 @@ class ClaimOp(Operation):
             backend.delete("Order", key)     # side-effect: remove it
         return {"found": data is not None, "data": data}
 
-app = abstract_data_app.init(
-    data_backend=backend,     # same instance
-    data_types=[Order],
-    operations=[ClaimOp],
-)
+app = abstract_data_app.init(data_backend=backend)  # same instance
+app.add_data_type(Order)
+app.add_operation(ClaimOp)
 ```
 
 Pass the **same backend instance** to both `init()` and close over it in the operation so they share the same store.
@@ -545,6 +597,45 @@ The return value of `call()` is JSON-serialised into `content[0].text`.
 
 ---
 
+## Programmatic tool inspection
+
+After registering data types and operations you can inspect the generated MCP tool specs without starting the server.
+
+### `app.list_mcp_tools()`
+
+Returns a list of all registered MCP tool spec dicts — the same payload served by the `tools/list` MCP method.
+
+```python
+tools = app.list_mcp_tools()
+for tool in tools:
+    print(tool["name"], "—", tool["description"])
+```
+
+### `app.get_mcp_spec(type_name, tool_type)`
+
+Returns the spec for one specific auto-generated tool.
+
+```python
+from abstract_data_app import MCPToolType
+
+spec = app.get_mcp_spec(Product.__name__, MCPToolType.UPSERT)
+# spec is a dict: {"name": "Product_upsert", "description": "...", "inputSchema": {...}}
+```
+
+`MCPToolType` values:
+
+| Value | Tool name suffix | Description |
+|---|---|---|
+| `MCPToolType.UPSERT` | `_upsert` | Insert or update by key |
+| `MCPToolType.DELETE` | `_delete` | Delete by key |
+| `MCPToolType.GET` | `_get` | Retrieve by key |
+| `MCPToolType.LIST` | `_list` | List all items (optional jq filter) |
+| `MCPToolType.VALIDATE` | `_validate` | Validate a payload without storing it |
+
+Raises `KeyError` if no matching tool is found.
+
+---
+
 ## Validation tool
 
 Each data type gets a `TypeName_validate` MCP tool that checks a payload without writing it to the store. It runs two phases:
@@ -688,8 +779,8 @@ postgres = PostgresDataBackend("postgresql://user:pass@db-host/mydb")
 
 app = abstract_data_app.init(
     data_backend=[sqlite, postgres],   # sqlite is primary (reads); both get writes
-    data_types=[Product],
 )
+app.add_data_type(Product)
 ```
 
 If any backend raises an exception during a write, the error is collected and a `RuntimeError` is raised after all backends have been attempted. The error message identifies which backends failed.
@@ -733,13 +824,11 @@ class MyBackend(DataBackend):
         ...
 ```
 
-Then pass an instance to `init()`:
+Then pass an instance to `init()` and register your data types:
 
 ```python
-app = abstract_data_app.init(
-    data_backend=MyBackend(...),
-    data_types=[...],
-)
+app = abstract_data_app.init(data_backend=MyBackend(...))
+app.add_data_type(MyType)
 ```
 
 ---
@@ -753,7 +842,6 @@ from abstract_data_app import Config
 
 app = abstract_data_app.init(
     data_backend=...,
-    data_types=...,
     config=Config(
         host="0.0.0.0",
         port=8000,
@@ -822,20 +910,19 @@ This means the process stays alive even under unusual failure conditions, and wi
 
 ## Running tests
 
-The test suite uses pytest with three user-journey test files. Each test file starts its own server on a free port using a module-scoped fixture, so all three suites can run in parallel without conflicts.
+The test suite uses pytest with four user-journey test files. Each test file starts its own server on a free port using a module-scoped fixture, so all suites can run in parallel without conflicts.
 
 ```bash
-pytest tests/ -v
+poetry run pytest tests/ -v
 ```
 
 Example output:
 
 ```
 tests/test_journey_1_crud_list_delete.py::test_step_3_upsert_book1            PASSED
-tests/test_journey_1_crud_list_delete.py::test_step_4_upsert_book2            PASSED
 ...
-tests/test_journey_3_recursive_schema_jq_filters.py::test_step_10c_...        PASSED
-26 passed in 0.85s
+tests/test_journey_4_mcp_spec.py::test_step_10_crud_round_trip                PASSED
+34 passed in 0.41s
 ```
 
 To test your own code the same way, use `abstract_data_app.init()` as normal, then access `app._flask` for the Flask test client or start a real server on a free port:
@@ -853,9 +940,9 @@ def find_free_port():
 port = find_free_port()
 app = abstract_data_app.init(
     data_backend=LocalSqliteDataBackend(":memory:"),
-    data_types=[MyType],
     config=Config(host="127.0.0.1", port=port),
 )
+app.add_data_type(MyType)
 
 thread = threading.Thread(
     target=app._flask.run,

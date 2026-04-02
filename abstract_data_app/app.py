@@ -14,6 +14,16 @@ Architecture
 - ``serve_forever()`` catches server-level exceptions and restarts automatically
   so the process stays alive indefinitely.
 
+Building an app
+---------------
+Create an :class:`App` via :func:`init`, then register data types and operations
+one at a time before starting the server::
+
+    app = abstract_data_app.init(data_backend=LocalSqliteDataBackend(":memory:"))
+    app.add_data_type(MyType, MCP_SPEC={"field": {"description": "My field"}})
+    app.add_operation(MyOperation)
+    app.serve_forever()
+
 MCP transport
 -------------
 Implements the *Streamable HTTP* transport (JSON-RPC 2.0 over HTTP POST).
@@ -21,13 +31,15 @@ Supported methods: ``initialize``, ``notifications/initialized``,
 ``tools/list``, ``tools/call``.
 """
 
+import copy
+import dataclasses
 import json
 import sys
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from socketserver import TCPServer
+from enum import Enum
 from typing import Any, Optional
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
 
@@ -37,6 +49,26 @@ from .backend import DataBackend
 from .config import Config
 from .operations import Operation
 from .validation import dataclass_to_json_schema, validate_dataclass_dict
+
+
+# ---------------------------------------------------------------------------
+# MCPToolType enum
+# ---------------------------------------------------------------------------
+
+class MCPToolType(str, Enum):
+    """
+    The type of auto-generated MCP tool for a registered data type.
+
+    Used with :meth:`App.get_mcp_spec` to retrieve the spec for a specific
+    tool variant::
+
+        spec = app.get_mcp_spec("Product", MCPToolType.UPSERT)
+    """
+    UPSERT = "upsert"
+    DELETE = "delete"
+    GET = "get"
+    LIST = "list"
+    VALIDATE = "validate"
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +113,8 @@ class App:
     """
     The assembled HTTP + MCP application.
 
-    Do not construct directly — use :func:`init`.
+    Do not construct directly — use :func:`init`, then call
+    :meth:`add_data_type` and :meth:`add_operation` before starting the server.
     """
 
     _MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -90,8 +123,6 @@ class App:
     def __init__(
         self,
         data_backends: list[DataBackend],
-        data_types: list[type],
-        operations: list[type[Operation]],
         config: Config,
     ) -> None:
         if not data_backends:
@@ -101,24 +132,152 @@ class App:
         self.config = config
 
         # Map type name → class
-        self.data_types: dict[str, type] = {dt.__name__: dt for dt in data_types}
+        self.data_types: dict[str, type] = {}
 
-        # Instantiate operations; key by TOOL_SPEC["name"] for O(1) dispatch
+        # Map type name → MCP_SPEC field dict (field_name → {"description": ...})
+        self._mcp_field_specs: dict[str, dict] = {}
+
+        # Keyed by TOOL_SPEC["name"] for O(1) dispatch
         self.operations: dict[str, Operation] = {}
-        for op_class in operations:
-            instance = op_class()
-            tool_name = instance.TOOL_SPEC.get("name") or op_class.__name__
-            self.operations[tool_name] = instance
 
         # One write-lock per data type
-        self._write_locks: dict[str, threading.Lock] = {
-            name: threading.Lock() for name in self.data_types
-        }
+        self._write_locks: dict[str, threading.Lock] = {}
 
-        # Pre-build MCP tool list once (it's static after init)
-        self._mcp_tools: list[dict] = self._build_mcp_tools()
+        # Pre-built MCP tool list (rebuilt whenever add_data_type / add_operation is called)
+        self._mcp_tools: list[dict] = []
 
-        self._flask = self._create_flask_app()
+        # Flask app built lazily on first access (or rebuilt after registration changes)
+        self._flask_cached: Optional[Flask] = None
+
+    # ------------------------------------------------------------------
+    # Registration API
+    # ------------------------------------------------------------------
+
+    @property
+    def _flask(self) -> Flask:
+        """Lazily build (or rebuild) the Flask app on first access."""
+        if self._flask_cached is None:
+            self._flask_cached = self._create_flask_app()
+        return self._flask_cached
+
+    def add_data_type(self, data_type: type, MCP_SPEC: Optional[dict] = None) -> "App":
+        """
+        Register a dataclass as a CRUD resource and MCP tool set.
+
+        This method must be called before :meth:`serve_forever`.  It can be
+        called multiple times to register additional types.
+
+        Args:
+            data_type: A Python ``@dataclass`` class.
+            MCP_SPEC:  Optional dict mapping field names to
+                       ``{"description": "..."}`` dicts.  Every key in
+                       *MCP_SPEC* must be a field name on *data_type*; the
+                       framework raises ``ValueError`` if an unknown key is
+                       found.  Fields omitted from *MCP_SPEC* will have no
+                       description in the generated tool schema.
+
+        Returns:
+            ``self``, enabling optional method chaining.
+
+        Raises:
+            ValueError: If *data_type* is not a dataclass, or if *MCP_SPEC*
+                        contains keys that are not field names of *data_type*.
+
+        Example::
+
+            app.add_data_type(
+                Product,
+                MCP_SPEC={
+                    "name":     {"description": "Display name of the product"},
+                    "price":    {"description": "Price in USD"},
+                    "in_stock": {"description": "Whether the item is available"},
+                },
+            )
+        """
+        if not dataclasses.is_dataclass(data_type):
+            raise ValueError(f"{data_type.__name__} is not a dataclass")
+        if MCP_SPEC is not None:
+            _assert_mcp_spec_matches(data_type, MCP_SPEC)
+
+        type_name = data_type.__name__
+        self.data_types[type_name] = data_type
+        self._mcp_field_specs[type_name] = MCP_SPEC or {}
+        self._write_locks[type_name] = threading.Lock()
+        self._mcp_tools = self._build_mcp_tools()
+        self._flask_cached = None  # force Flask rebuild on next access
+        return self
+
+    def add_operation(self, op_class: type[Operation]) -> "App":
+        """
+        Register an :class:`~abstract_data_app.Operation` subclass as an MCP tool.
+
+        The operation is exposed under the name given in its ``TOOL_SPEC["name"]``
+        field.  This method can be called multiple times to add additional
+        operations.
+
+        Args:
+            op_class: A concrete subclass of :class:`~abstract_data_app.Operation`.
+
+        Returns:
+            ``self``, enabling optional method chaining.
+
+        Example::
+
+            app.add_operation(ClaimOp)
+        """
+        instance = op_class()
+        tool_name = instance.TOOL_SPEC.get("name") or op_class.__name__
+        self.operations[tool_name] = instance
+        self._mcp_tools = self._build_mcp_tools()
+        self._flask_cached = None  # force Flask rebuild on next access
+        return self
+
+    # ------------------------------------------------------------------
+    # Programmatic MCP tool inspection
+    # ------------------------------------------------------------------
+
+    def list_mcp_tools(self) -> list[dict]:
+        """
+        Return the full list of registered MCP tool specs.
+
+        Each entry is a dict with ``name``, ``description``, and
+        ``inputSchema`` keys — the same structure served by the
+        ``tools/list`` MCP method.
+
+        Returns:
+            A new list of tool spec dicts (shallow copy of the internal list).
+        """
+        return list(self._mcp_tools)
+
+    def get_mcp_spec(self, type_name: str, tool_type: MCPToolType) -> dict:
+        """
+        Return the MCP tool spec for one auto-generated data-type tool.
+
+        Args:
+            type_name: The ``__name__`` of a registered dataclass
+                       (e.g. ``Product.__name__`` or ``"Product"``).
+            tool_type: A :class:`MCPToolType` value selecting which of the
+                       five auto-generated tools to retrieve.
+
+        Returns:
+            The tool spec dict (``name``, ``description``, ``inputSchema``).
+
+        Raises:
+            KeyError: If no matching tool is found.
+
+        Example::
+
+            spec = app.get_mcp_spec(Product.__name__, MCPToolType.UPSERT)
+            print(spec["inputSchema"]["properties"]["data"]["properties"])
+        """
+        tool_name = f"{type_name}_{tool_type.value}"
+        for tool in self._mcp_tools:
+            if tool["name"] == tool_name:
+                return tool
+        available = [t["name"] for t in self._mcp_tools]
+        raise KeyError(
+            f"No MCP tool '{tool_name}' registered. Available tools: {available}"
+        )
 
     # ------------------------------------------------------------------
     # Flask app construction
@@ -398,7 +557,13 @@ class App:
         tools: list[dict] = []
 
         for type_name, data_type in self.data_types.items():
-            schema = dataclass_to_json_schema(data_type)
+            raw_schema = dataclass_to_json_schema(data_type)
+            field_specs = self._mcp_field_specs.get(type_name, {})
+            schema = (
+                _apply_field_descriptions(raw_schema, field_specs)
+                if field_specs
+                else raw_schema
+            )
 
             tools.append({
                 "name": f"{type_name}_upsert",
@@ -469,7 +634,7 @@ class App:
                     "type": "object",
                     "properties": {
                         "data": {
-                            "type": "object",
+                            **schema,
                             "description": f"The {type_name} payload to validate",
                         },
                     },
@@ -577,36 +742,70 @@ def _require(args: dict, *keys: str) -> None:
         raise _McpInvalidParams(f"Missing required argument(s): {missing}")
 
 
+def _assert_mcp_spec_matches(data_type: type, mcp_spec: dict) -> None:
+    """
+    Assert that every key in *mcp_spec* is a valid field name on *data_type*.
+
+    Raises:
+        ValueError: If *mcp_spec* contains keys not present as fields.
+    """
+    field_names = {f.name for f in dataclasses.fields(data_type)}
+    unknown = set(mcp_spec.keys()) - field_names
+    if unknown:
+        raise ValueError(
+            f"MCP_SPEC contains fields not present in {data_type.__name__}: "
+            f"{sorted(unknown)}. Valid fields: {sorted(field_names)}"
+        )
+
+
+def _apply_field_descriptions(schema: dict, field_specs: dict) -> dict:
+    """
+    Return a deep copy of *schema* with ``description`` values from
+    *field_specs* applied to the matching ``properties`` entries.
+
+    Only entries that include a ``"description"`` key in *field_specs* are
+    modified; other properties are left untouched.
+    """
+    schema = copy.deepcopy(schema)
+    properties = schema.get("properties", {})
+    for field_name, spec in field_specs.items():
+        if field_name in properties and "description" in spec:
+            properties[field_name]["description"] = spec["description"]
+    return schema
+
+
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
 
 def init(
     data_backend: list[DataBackend] | DataBackend,
-    data_types: list[type],
-    operations: list[type[Operation]] | None = None,
     config: Config | None = None,
 ) -> App:
     """
     Create and return an :class:`App` instance.
 
+    After calling ``init``, register data types and operations by calling
+    :meth:`App.add_data_type` and :meth:`App.add_operation` on the returned
+    object before starting the server.
+
     Args:
         data_backend: One backend or a list of backends.  All write operations
-                      are fanned out to every backend in the list.
-        data_types:   List of Python *dataclass* classes to expose as CRUD
-                      resources and MCP tools.
-        operations:   List of :class:`~abstract_data_app.Operation` subclasses
-                      to expose as MCP tools.
+                      are fanned out to every backend in the list; the first
+                      backend is used for all reads.
         config:       Optional :class:`~abstract_data_app.Config`; defaults are
                       used if not provided.
+
+    Returns:
+        A configured :class:`App` instance ready for registration and serving.
 
     Example::
 
         app = abstract_data_app.init(
-            data_backend=[LocalSqliteDataBackend("store.db")],
-            data_types=[MyDataType],
-            operations=[MyOperation],
+            data_backend=LocalSqliteDataBackend("store.db"),
         )
+        app.add_data_type(MyDataType, MCP_SPEC={"name": {"description": "Item name"}})
+        app.add_operation(MyOperation)
         app.serve_forever()
     """
     if isinstance(data_backend, DataBackend):
@@ -614,7 +813,5 @@ def init(
 
     return App(
         data_backends=data_backend,
-        data_types=data_types,
-        operations=list(operations or []),
         config=config or Config(),
     )

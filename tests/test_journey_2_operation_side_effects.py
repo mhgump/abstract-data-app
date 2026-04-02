@@ -89,11 +89,11 @@ def backend_and_client():
             return {"found": False, "data": None}
 
     app = abstract_data_app.init(
-        data_backend=[backend],
-        data_types=[Record],
-        operations=[ClaimOp],
+        data_backend=backend,
         config=Config(host="127.0.0.1", port=port, print_errors=True),
     )
+    app.add_data_type(Record)
+    app.add_operation(ClaimOp)
     start_server(app, port)
     return backend, Client(f"http://127.0.0.1:{port}")
 

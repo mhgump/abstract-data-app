@@ -71,10 +71,17 @@ class Operation1(Operation):
 
 
 app = abstract_data_app.init(
-    data_backend=[LocalSqliteDataBackend(":memory:")],
-    data_types=[DataType],
-    operations=[Operation1],
+    data_backend=LocalSqliteDataBackend(":memory:"),
 )
+app.add_data_type(
+    DataType,
+    MCP_SPEC={
+        "field": {"description": "A string value for this item"},
+        "keys":  {"description": "List of string keys associated with the item"},
+        "flags": {"description": "Boolean flags keyed by name"},
+    },
+)
+app.add_operation(Operation1)
 
 if __name__ == "__main__":
     app.serve_forever()
