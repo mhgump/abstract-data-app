@@ -33,12 +33,15 @@ Supported methods: ``initialize``, ``notifications/initialized``,
 
 import copy
 import dataclasses
+import inspect
 import json
 import sys
 import threading
 import time
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
@@ -47,7 +50,7 @@ from flask import Flask, jsonify, request
 
 from .backend import DataBackend
 from .config import Config
-from .operations import Operation
+from .operations import CancellationToken, Operation, OperationCancelledError
 from .validation import dataclass_to_json_schema, validate_dataclass_dict
 
 
@@ -69,6 +72,51 @@ class MCPToolType(str, Enum):
     GET = "get"
     LIST = "list"
     VALIDATE = "validate"
+
+
+# ---------------------------------------------------------------------------
+# Async operation record
+# ---------------------------------------------------------------------------
+
+_OP_PENDING = "pending"
+_OP_RUNNING = "running"
+_OP_COMPLETED = "completed"
+_OP_FAILED = "failed"
+_OP_CANCELLED = "cancelled"
+_OP_TERMINAL = {_OP_COMPLETED, _OP_FAILED, _OP_CANCELLED}
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class _OperationRecord:
+    """Tracks the full lifecycle of one async operation invocation."""
+
+    def __init__(self, operation_id: str, operation_name: str, tool_input: dict) -> None:
+        self.operation_id = operation_id
+        self.operation_name = operation_name
+        self.status = _OP_PENDING
+        self.created_at: str = _utcnow()
+        self.started_at: Optional[str] = None
+        self.completed_at: Optional[str] = None
+        self.input = tool_input
+        self.result: Any = None
+        self.error: Optional[str] = None
+        self.cancellation_token = CancellationToken()
+
+    def to_dict(self) -> dict:
+        return {
+            "operation_id": self.operation_id,
+            "operation_name": self.operation_name,
+            "status": self.status,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "input": self.input,
+            "result": self.result,
+            "error": self.error,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +196,10 @@ class App:
 
         # Flask app built lazily on first access (or rebuilt after registration changes)
         self._flask_cached: Optional[Flask] = None
+
+        # Async operation tracking
+        self._op_records: dict[str, _OperationRecord] = {}
+        self._op_records_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Registration API
@@ -313,6 +365,8 @@ class App:
         for type_name in self.data_types:
             self._register_crud_routes(app, type_name)
 
+        self._register_operation_routes(app)
+
         app.add_url_rule(
             self.config.mcp_path,
             endpoint="mcp",
@@ -420,6 +474,125 @@ class App:
 
         handler.__name__ = f"{type_name}_list_handler"
         return handler
+
+    # ------------------------------------------------------------------
+    # Async operation routes  (POST/GET/DELETE /operations/<name_or_id>)
+    # ------------------------------------------------------------------
+
+    def _register_operation_routes(self, app: Flask) -> None:
+        app.add_url_rule(
+            "/operations/<name_or_id>",
+            endpoint="operations",
+            view_func=self._make_operations_handler(),
+            methods=["GET", "POST", "DELETE"],
+        )
+
+    def _make_operations_handler(self):
+        def handler(name_or_id: str):
+            try:
+                method = request.method
+                if method == "POST":
+                    body = request.get_json(force=True, silent=True) or {}
+                    return self._handle_invoke_operation(name_or_id, body)
+                if method == "GET":
+                    return self._handle_get_operation(name_or_id)
+                if method == "DELETE":
+                    return self._handle_cancel_operation(name_or_id)
+                return jsonify({"error": f"Method {method} not allowed"}), 405
+            except Exception as exc:
+                self._log_error("operations handler", exc)
+                return jsonify({"error": str(exc)}), 500
+
+        handler.__name__ = "operations_handler"
+        return handler
+
+    def _handle_invoke_operation(self, op_name: str, tool_input: dict):
+        """POST /operations/<op_name> — run operation asynchronously, return operation record."""
+        if op_name not in self.operations:
+            return jsonify({"error": f"Operation '{op_name}' not found"}), 404
+
+        op = self.operations[op_name]
+        op_id = str(uuid.uuid4())
+        record = _OperationRecord(op_id, op_name, tool_input)
+
+        with self._op_records_lock:
+            self._op_records[op_id] = record
+
+        t = threading.Thread(
+            target=self._run_op_in_background,
+            args=(record, op),
+            daemon=True,
+            name=f"ada-op-{op_id[:8]}",
+        )
+        t.start()
+
+        with self._op_records_lock:
+            data = record.to_dict()
+        return jsonify(data), 202
+
+    def _handle_get_operation(self, op_id: str):
+        """GET /operations/<op_id> — return status and metadata for an operation."""
+        with self._op_records_lock:
+            record = self._op_records.get(op_id)
+            if record is None:
+                return jsonify({"error": f"Operation '{op_id}' not found"}), 404
+            data = record.to_dict()
+        return jsonify(data)
+
+    def _handle_cancel_operation(self, op_id: str):
+        """DELETE /operations/<op_id> — request cancellation of a running or pending operation."""
+        with self._op_records_lock:
+            record = self._op_records.get(op_id)
+            if record is None:
+                return jsonify({"error": f"Operation '{op_id}' not found"}), 404
+            if record.status in _OP_TERMINAL:
+                return jsonify({"error": f"Cannot cancel operation with status '{record.status}'"}), 409
+            record.cancellation_token.cancel()
+            if record.status == _OP_PENDING:
+                # Never started — mark terminal immediately.
+                record.status = _OP_CANCELLED
+                record.completed_at = _utcnow()
+            data = record.to_dict()
+        return jsonify(data)
+
+    def _run_op_in_background(self, record: _OperationRecord, op: Operation) -> None:
+        """Execute *op* in the calling thread, updating *record* throughout."""
+        with self._op_records_lock:
+            # If cancellation was requested between POST and thread start, skip.
+            if record.status == _OP_CANCELLED:
+                return
+            record.status = _OP_RUNNING
+            record.started_at = _utcnow()
+
+        try:
+            # Forward the cancellation token only if the operation declares a
+            # second parameter — preserves backward compatibility with existing
+            # Operation subclasses whose call() only accepts tool_input.
+            sig = inspect.signature(op.call)
+            accepts_token = len(sig.parameters) >= 2
+            token = record.cancellation_token
+
+            result = op.call(record.input, token) if accepts_token else op.call(record.input)
+
+            with self._op_records_lock:
+                if token.is_cancelled:
+                    record.status = _OP_CANCELLED
+                else:
+                    record.status = _OP_COMPLETED
+                    record.result = result
+        except OperationCancelledError as exc:
+            with self._op_records_lock:
+                record.status = _OP_CANCELLED
+                record.error = str(exc)
+        except Exception as exc:
+            self._log_error(f"Async operation '{record.operation_name}'", exc)
+            with self._op_records_lock:
+                record.status = _OP_FAILED
+                record.error = str(exc)
+        finally:
+            with self._op_records_lock:
+                if record.completed_at is None:
+                    record.completed_at = _utcnow()
 
     # ------------------------------------------------------------------
     # MCP endpoint

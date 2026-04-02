@@ -86,7 +86,7 @@ from .backend import (
     RedisDataBackend,
 )
 from .config import Config
-from .operations import Operation
+from .operations import CancellationToken, Operation, OperationCancelledError
 
 __all__ = [
     # Factory + App
@@ -97,8 +97,10 @@ __all__ = [
     "get_mcp_spec",
     # Config
     "Config",
-    # Operation base
+    # Operation base + cancellation
     "Operation",
+    "CancellationToken",
+    "OperationCancelledError",
     # Backends
     "DataBackend",
     "LocalSqliteDataBackend",
