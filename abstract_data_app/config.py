@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -22,3 +23,11 @@ class Config:
 
     mcp_path: str = "/mcp"
     """URL path for the MCP JSON-RPC endpoint."""
+
+    cors_origin: Optional[str] = "*"
+    """Value for the ``Access-Control-Allow-Origin`` response header.
+
+    Set to ``"*"`` (the default) to allow all origins, a specific origin
+    string to restrict cross-origin access, or ``None`` to disable CORS
+    headers entirely.
+    """

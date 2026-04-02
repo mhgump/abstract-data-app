@@ -320,6 +320,33 @@ class App:
             methods=["POST"],
         )
 
+        if self.config.cors_origin:
+            cors_origin = self.config.cors_origin
+
+            @app.before_request
+            def _handle_preflight():
+                if request.method == "OPTIONS":
+                    response = app.make_response("")
+                    response.headers["Access-Control-Allow-Origin"] = cors_origin
+                    response.headers["Access-Control-Allow-Methods"] = (
+                        "GET, POST, PUT, DELETE, OPTIONS"
+                    )
+                    response.headers["Access-Control-Allow-Headers"] = (
+                        "Content-Type, Authorization"
+                    )
+                    return response
+
+            @app.after_request
+            def _add_cors_headers(response):
+                response.headers["Access-Control-Allow-Origin"] = cors_origin
+                response.headers["Access-Control-Allow-Methods"] = (
+                    "GET, POST, PUT, DELETE, OPTIONS"
+                )
+                response.headers["Access-Control-Allow-Headers"] = (
+                    "Content-Type, Authorization"
+                )
+                return response
+
         @app.errorhandler(Exception)
         def _unhandled(exc: Exception):
             self._log_error("Unhandled exception in request", exc)
