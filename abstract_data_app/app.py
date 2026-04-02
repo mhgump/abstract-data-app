@@ -353,10 +353,12 @@ class App:
             return items
         try:
             import jq as jq_lib
-            result = jq_lib.first(jq_filter, items)
-            if result is None:
-                return []
-            return result if isinstance(result, list) else [result]
+            outputs = jq_lib.compile(jq_filter).input(items).all()
+            # A filter like [.[] | select(...)] produces one array output; unwrap it.
+            # A filter like .[] | select(...) produces N individual outputs; return as-is.
+            if len(outputs) == 1 and isinstance(outputs[0], list):
+                return outputs[0]
+            return outputs
         except ImportError:
             raise RuntimeError(
                 "jq filtering requires the 'jq' package. "
