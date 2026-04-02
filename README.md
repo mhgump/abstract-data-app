@@ -18,14 +18,15 @@ You declare your data shapes and custom logic. The framework generates the serve
 8. [jq filtering](#jq-filtering)
 9. [MCP server reference](#mcp-server-reference)
 10. [Programmatic tool inspection](#programmatic-tool-inspection)
-11. [Validation tool](#validation-tool)
-12. [Data backends](#data-backends)
-13. [Multiple backends](#multiple-backends)
-14. [Writing a custom backend](#writing-a-custom-backend)
-15. [Configuration reference](#configuration-reference)
-16. [Concurrency and thread safety](#concurrency-and-thread-safety)
-17. [Error handling and reliability](#error-handling-and-reliability)
-18. [Running tests](#running-tests)
+11. [Programmatic data access](#programmatic-data-access)
+12. [Validation tool](#validation-tool)
+13. [Data backends](#data-backends)
+14. [Multiple backends](#multiple-backends)
+15. [Writing a custom backend](#writing-a-custom-backend)
+16. [Configuration reference](#configuration-reference)
+17. [Concurrency and thread safety](#concurrency-and-thread-safety)
+18. [Error handling and reliability](#error-handling-and-reliability)
+19. [Running tests](#running-tests)
 
 ---
 
@@ -125,7 +126,7 @@ Once running, the server exposes:
 | **Data type** | A Python `@dataclass`. The framework uses its field names and type annotations to generate HTTP routes, MCP tools, and a validator. |
 | **Key** | A user-provided string that uniquely identifies one instance of a data type. Keys are not part of the dataclass itself; they are supplied separately in the URL or MCP tool call. |
 | **Operation** | A subclass of `Operation` with a `TOOL_SPEC` dict and a `call()` method. Exposed only as an MCP tool, not as an HTTP route. |
-| **Backend** | A storage implementation (`LocalSqliteDataBackend`, `PostgresDataBackend`, or `RedisDataBackend`). Multiple backends can be used simultaneously; all writes are fanned out to every backend. |
+| **Backend** | A storage implementation (`LocalSqliteDataBackend`, `PostgresDataBackend`, `RedisDataBackend`, or `HttpsDataBackend`). Multiple backends can be used simultaneously; all writes are fanned out to every backend. |
 | **App** | The assembled server object, obtained from `abstract_data_app.init(...)`. Call `add_data_type()` and `add_operation()` to register types and operations, then `.serve_forever()` to start it. |
 | **MCP_SPEC** | An optional dict passed to `add_data_type()` that maps field names to `{"description": "..."}` entries, enriching the auto-generated MCP tool schemas with human-readable field descriptions. |
 
@@ -636,6 +637,114 @@ Raises `KeyError` if no matching tool is found.
 
 ---
 
+## Programmatic data access
+
+The `App` object exposes a full CRUD API that works **without starting an HTTP server**. This is useful for scripts, tests, and any code that wants to use the storage layer directly from Python.
+
+All five methods can be called as soon as `add_data_type()` has been called — no call to `serve_forever()` is required.
+
+### `app.upsert(data_type, key, data)`
+
+Insert or update an item. `data` may be a dataclass instance or a plain `dict`.
+
+```python
+from dataclasses import dataclass
+import abstract_data_app
+from abstract_data_app import LocalSqliteDataBackend
+
+@dataclass
+class Widget:
+    name: str
+    price: float
+
+app = abstract_data_app.init(data_backend=LocalSqliteDataBackend(":memory:"))
+app.add_data_type(Widget)
+
+# From a dataclass instance
+result = app.upsert(Widget, "w1", Widget(name="Cog", price=4.99))
+# result == {"key": "w1", "data": {"name": "Cog", "price": 4.99}}
+
+# From a plain dict
+result = app.upsert(Widget, "w2", {"name": "Sprocket", "price": 2.49})
+```
+
+Returns `{"key": key, "data": <data dict>}`.
+
+---
+
+### `app.get(data_type, key)`
+
+Retrieve one item. Returns a **dataclass instance**, or `None` if the key does not exist.
+
+```python
+widget = app.get(Widget, "w1")
+# widget is a Widget instance (not a dict)
+print(widget.name)   # "Cog"
+print(widget.price)  # 4.99
+
+missing = app.get(Widget, "no-such-key")
+# missing is None
+```
+
+---
+
+### `app.delete(data_type, key)`
+
+Delete one item. Returns `True` if the key existed, `False` if it did not.
+
+```python
+existed = app.delete(Widget, "w1")  # True
+existed = app.delete(Widget, "w1")  # False — already gone
+```
+
+---
+
+### `app.list(data_type)`
+
+List all items of a type. Returns a list of `{"key": str, "data": <dataclass instance>}` dicts.
+
+```python
+items = app.list(Widget)
+# [
+#   {"key": "w2", "data": Widget(name="Sprocket", price=2.49)},
+# ]
+for item in items:
+    print(item["key"], item["data"].price)
+```
+
+---
+
+### `app.call(operation_name, tool_input)`
+
+Invoke a registered operation by its `TOOL_SPEC["name"]`. This is the programmatic equivalent of an MCP `tools/call` request.
+
+```python
+class DiscountOp(Operation):
+    TOOL_SPEC = {
+        "name": "apply_discount",
+        "description": "Apply a percentage discount",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key":     {"type": "string"},
+                "percent": {"type": "number"},
+            },
+            "required": ["key", "percent"],
+        },
+    }
+
+    def call(self, tool_input):
+        return {"discounted_price": 4.99 * (1 - tool_input["percent"] / 100)}
+
+app.add_operation(DiscountOp)
+result = app.call("apply_discount", {"key": "w1", "percent": 10})
+# result == {"discounted_price": 4.491}
+```
+
+Raises `KeyError` for any method if the data type or operation has not been registered.
+
+---
+
 ## Validation tool
 
 Each data type gets a `TypeName_validate` MCP tool that checks a payload without writing it to the store. It runs two phases:
@@ -689,7 +798,7 @@ Validation rules by type:
 
 ## Data backends
 
-A backend is any class that implements the `DataBackend` abstract base class. Three implementations are included.
+A backend is any class that implements the `DataBackend` abstract base class. Four implementations are included.
 
 ### `LocalSqliteDataBackend`
 
@@ -764,6 +873,41 @@ backend = RedisDataBackend(host="redis.example.com", password="secret", ssl=True
 Data is stored under keys with the prefix `abstract_data_app:data:<TypeName>:<key>`. A Redis Set at `abstract_data_app:index:<TypeName>` tracks which keys exist for each type. The redis-py client uses a built-in connection pool, which is thread-safe.
 
 **Note:** The Redis dry-run validation only checks JSON serialisability, not a real transaction rollback, because Redis does not support nested transactions.
+
+---
+
+### `HttpsDataBackend`
+
+Proxies every operation to a **remote abstract-data-app instance** over HTTP or HTTPS. No extra dependencies — uses Python's standard library `urllib`.
+
+```python
+from abstract_data_app import HttpsDataBackend
+
+backend = HttpsDataBackend("https://myserver.example.com")
+# or for local development:
+backend = HttpsDataBackend("http://localhost:8000")
+```
+
+Each `DataBackend` method maps to the corresponding remote HTTP route:
+
+| Method | Remote route |
+|---|---|
+| `upsert` | `PUT /data/<TypeName>/<key>` |
+| `delete` | `DELETE /data/<TypeName>/<key>` |
+| `get` | `GET /data/<TypeName>/<key>` |
+| `list_all` | `GET /data/<TypeName>` |
+| `dry_run_upsert` | not supported — always returns `None` |
+
+**Typical use case:** run a lightweight local app that delegates all storage to a shared remote server.
+
+```python
+remote = HttpsDataBackend("https://shared-store.example.com")
+app = abstract_data_app.init(data_backend=remote)
+app.add_data_type(Widget)
+app.serve_forever()   # all reads/writes go to the remote server
+```
+
+`HttpsDataBackend` can also be combined with local backends in a multi-backend setup — for example, to keep a local SQLite cache while writing through to a remote server (see [Multiple backends](#multiple-backends)).
 
 ---
 

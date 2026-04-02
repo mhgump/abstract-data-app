@@ -79,8 +79,9 @@ Programmatic tool inspection
 """
 
 from .app import App, MCPToolType, get_mcp_spec, init
-from .backend import (
+from .backends import (
     DataBackend,
+    HttpsDataBackend,
     LocalSqliteDataBackend,
     PostgresDataBackend,
     RedisDataBackend,
@@ -103,6 +104,7 @@ __all__ = [
     "OperationCancelledError",
     # Backends
     "DataBackend",
+    "HttpsDataBackend",
     "LocalSqliteDataBackend",
     "PostgresDataBackend",
     "RedisDataBackend",

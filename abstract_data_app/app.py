@@ -31,6 +31,8 @@ Supported methods: ``initialize``, ``notifications/initialized``,
 ``tools/list``, ``tools/call``.
 """
 
+from __future__ import annotations
+
 import copy
 import dataclasses
 import inspect
@@ -48,7 +50,7 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
 
 from flask import Flask, jsonify, request
 
-from .backend import DataBackend
+from .backends import DataBackend
 from .config import Config
 from .operations import CancellationToken, Operation, OperationCancelledError
 from .validation import dataclass_to_json_schema, validate_dataclass_dict
@@ -353,6 +355,129 @@ class App:
         raise KeyError(
             f"No MCP tool '{tool_name}' registered. Available tools: {available}"
         )
+
+    # ------------------------------------------------------------------
+    # Programmatic data access  (no HTTP server required)
+    # ------------------------------------------------------------------
+
+    def upsert(self, data_type: type, key: str, data: Any) -> dict:
+        """
+        Insert or update an item in all backends.
+
+        Can be used without calling :meth:`serve_forever`.
+
+        Args:
+            data_type: The registered dataclass class (e.g. ``Widget``).
+            key: The item's string key.
+            data: The item's data — either a dataclass instance or a plain
+                  ``dict``.  Dataclass instances are converted automatically
+                  via :func:`dataclasses.asdict`.
+
+        Returns:
+            ``{"key": key, "data": <data dict>}``
+
+        Raises:
+            KeyError: If *data_type* has not been registered via
+                      :meth:`add_data_type`.
+        """
+        type_name = data_type.__name__
+        if type_name not in self.data_types:
+            raise KeyError(f"Data type '{type_name}' is not registered. Call add_data_type() first.")
+        if dataclasses.is_dataclass(data) and not isinstance(data, type):
+            data = dataclasses.asdict(data)
+        return self._do_upsert(type_name, key, data)
+
+    def get(self, data_type: type, key: str) -> Optional[Any]:
+        """
+        Retrieve one item from the primary backend.
+
+        Can be used without calling :meth:`serve_forever`.
+
+        Args:
+            data_type: The registered dataclass class.
+            key: The item's string key.
+
+        Returns:
+            A dataclass instance constructed from the stored data, or ``None``
+            if the key does not exist.
+
+        Raises:
+            KeyError: If *data_type* has not been registered.
+        """
+        type_name = data_type.__name__
+        if type_name not in self.data_types:
+            raise KeyError(f"Data type '{type_name}' is not registered. Call add_data_type() first.")
+        raw = self._do_get(type_name, key)
+        if raw is None:
+            return None
+        return data_type(**raw)
+
+    def delete(self, data_type: type, key: str) -> bool:
+        """
+        Delete one item from all backends.
+
+        Can be used without calling :meth:`serve_forever`.
+
+        Args:
+            data_type: The registered dataclass class.
+            key: The item's string key.
+
+        Returns:
+            ``True`` if the key existed and was deleted, ``False`` if it was
+            not found.
+
+        Raises:
+            KeyError: If *data_type* has not been registered.
+        """
+        type_name = data_type.__name__
+        if type_name not in self.data_types:
+            raise KeyError(f"Data type '{type_name}' is not registered. Call add_data_type() first.")
+        return self._do_delete(type_name, key)["deleted"]
+
+    def list(self, data_type: type) -> list:
+        """
+        List all items of a given type from the primary backend.
+
+        Can be used without calling :meth:`serve_forever`.
+
+        Args:
+            data_type: The registered dataclass class.
+
+        Returns:
+            A list of ``{"key": str, "data": <dataclass instance>}`` dicts,
+            one per stored item.
+
+        Raises:
+            KeyError: If *data_type* has not been registered.
+        """
+        type_name = data_type.__name__
+        if type_name not in self.data_types:
+            raise KeyError(f"Data type '{type_name}' is not registered. Call add_data_type() first.")
+        raw_items = self._do_list(type_name, None)
+        return [{"key": item["key"], "data": data_type(**item["data"])} for item in raw_items]
+
+    def call(self, operation_name: str, tool_input: dict) -> Any:
+        """
+        Invoke a registered operation by name.
+
+        Can be used without calling :meth:`serve_forever`.
+
+        Args:
+            operation_name: The name from the operation's ``TOOL_SPEC["name"]``
+                            field.
+            tool_input: The argument dict forwarded to the operation's
+                        :meth:`~abstract_data_app.Operation.call` method.
+
+        Returns:
+            Whatever the operation's :meth:`~abstract_data_app.Operation.call`
+            method returns.
+
+        Raises:
+            KeyError: If no operation with that name is registered.
+        """
+        if operation_name not in self.operations:
+            raise KeyError(f"Operation '{operation_name}' is not registered. Call add_operation() first.")
+        return self.operations[operation_name].call(tool_input)
 
     # ------------------------------------------------------------------
     # Flask app construction
