@@ -1,0 +1,12 @@
+flask>=3.0
+jq>=1.6
+
+[all]
+psycopg2-binary>=2.9
+redis>=5.0
+
+[postgres]
+psycopg2-binary>=2.9
+
+[redis]
+redis>=5.0

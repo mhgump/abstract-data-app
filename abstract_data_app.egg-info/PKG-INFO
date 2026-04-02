@@ -1,0 +1,14 @@
+Metadata-Version: 2.1
+Name: abstract-data-app
+Version: 0.1.0
+Summary: Library for building HTTP CRUD + MCP server apps from Python dataclasses and operations
+Requires-Python: >=3.10
+Requires-Dist: flask>=3.0
+Requires-Dist: jq>=1.6
+Provides-Extra: postgres
+Requires-Dist: psycopg2-binary>=2.9; extra == "postgres"
+Provides-Extra: redis
+Requires-Dist: redis>=5.0; extra == "redis"
+Provides-Extra: all
+Requires-Dist: psycopg2-binary>=2.9; extra == "all"
+Requires-Dist: redis>=5.0; extra == "all"

@@ -1,0 +1,12 @@
+pyproject.toml
+abstract_data_app/__init__.py
+abstract_data_app/app.py
+abstract_data_app/backend.py
+abstract_data_app/config.py
+abstract_data_app/operations.py
+abstract_data_app/validation.py
+abstract_data_app.egg-info/PKG-INFO
+abstract_data_app.egg-info/SOURCES.txt
+abstract_data_app.egg-info/dependency_links.txt
+abstract_data_app.egg-info/requires.txt
+abstract_data_app.egg-info/top_level.txt
