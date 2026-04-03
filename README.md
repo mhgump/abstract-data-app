@@ -19,14 +19,15 @@ You declare your data shapes and custom logic. The framework generates the serve
 9. [MCP server reference](#mcp-server-reference)
 10. [Programmatic tool inspection](#programmatic-tool-inspection)
 11. [Programmatic data access](#programmatic-data-access)
-12. [Validation tool](#validation-tool)
-13. [Data backends](#data-backends)
-14. [Multiple backends](#multiple-backends)
-15. [Writing a custom backend](#writing-a-custom-backend)
-16. [Configuration reference](#configuration-reference)
-17. [Concurrency and thread safety](#concurrency-and-thread-safety)
-18. [Error handling and reliability](#error-handling-and-reliability)
-19. [Running tests](#running-tests)
+12. [on_write callbacks](#on_write-callbacks)
+13. [Validation tool](#validation-tool)
+14. [Data backends](#data-backends)
+15. [Multiple backends](#multiple-backends)
+16. [Writing a custom backend](#writing-a-custom-backend)
+17. [Configuration reference](#configuration-reference)
+18. [Concurrency and thread safety](#concurrency-and-thread-safety)
+19. [Error handling and reliability](#error-handling-and-reliability)
+20. [Running tests](#running-tests)
 
 ---
 
@@ -742,6 +743,93 @@ result = app.call("apply_discount", {"key": "w1", "percent": 10})
 ```
 
 Raises `KeyError` for any method if the data type or operation has not been registered.
+
+---
+
+## on_write callbacks
+
+Register a function to be called every time a write (upsert or delete) succeeds for a given data type.  Callbacks fire from **every** write path — the programmatic API, the HTTP routes, and the MCP tools — because they all share the same internal write logic.
+
+### `app.add_on_write_callback(data_type, on_write)`
+
+```python
+def on_write(operation: str, key: str, data: dict | None) -> None:
+    ...
+```
+
+| Argument | Type | Value |
+|---|---|---|
+| `operation` | `str` | `"upsert"` or `"delete"` |
+| `key` | `str` | The item key |
+| `data` | `dict \| None` | Written data dict for upserts; `None` for deletes |
+
+The type must already be registered with `add_data_type()` before a callback can be attached.  The method returns `self` for chaining.
+
+### Basic example — audit log
+
+```python
+from dataclasses import dataclass
+import abstract_data_app
+from abstract_data_app import LocalSqliteDataBackend
+
+@dataclass
+class Order:
+    product: str
+    quantity: int
+    shipped: bool
+
+def audit_log(operation: str, key: str, data: dict | None) -> None:
+    if operation == "upsert":
+        print(f"[upsert] {key} → {data}")
+    else:
+        print(f"[delete] {key}")
+
+app = abstract_data_app.init(data_backend=LocalSqliteDataBackend("orders.db"))
+app.add_data_type(Order)
+app.add_on_write_callback(Order, audit_log)
+app.serve_forever()
+```
+
+### Multiple callbacks
+
+Multiple callbacks can be registered for the same type.  They are called in registration order.
+
+```python
+app.add_on_write_callback(Order, send_to_audit_log)
+app.add_on_write_callback(Order, invalidate_cache)
+app.add_on_write_callback(Order, publish_event)
+```
+
+### Type isolation
+
+Callbacks are scoped to the type they are registered on.  Writes to `Order` never fire `Invoice` callbacks, and vice-versa.
+
+```python
+app.add_on_write_callback(Order, on_order_write)
+app.add_on_write_callback(Invoice, on_invoice_write)
+```
+
+### Method chaining
+
+`add_on_write_callback` returns `self`, so it can be chained with other registration methods:
+
+```python
+app = (
+    abstract_data_app.init(data_backend=LocalSqliteDataBackend(":memory:"))
+    .add_data_type(Order)
+    .add_on_write_callback(Order, audit_log)
+    .add_data_type(Invoice)
+    .add_on_write_callback(Invoice, audit_log)
+)
+```
+
+### Error handling
+
+If a callback raises an exception, the error is logged to `stderr` (respecting `Config.print_errors`) and the remaining callbacks in the chain still run.  The write is considered successful regardless — a misbehaving callback never causes the write to appear to fail from the caller's perspective.
+
+### Thread safety
+
+Callbacks are invoked **after** the per-type write lock is released, so they may safely call back into the app (e.g. to read related data) without risking a deadlock.  If multiple threads upsert concurrently, each write fires its callbacks independently.
 
 ---
 

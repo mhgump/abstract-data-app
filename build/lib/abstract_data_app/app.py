@@ -193,9 +193,6 @@ class App:
         # One write-lock per data type
         self._write_locks: dict[str, threading.Lock] = {}
 
-        # Callbacks fired after every successful write, keyed by type name
-        self._write_callbacks: dict[str, list] = {}
-
         # Pre-built MCP tool list (rebuilt whenever add_data_type / add_operation is called)
         self._mcp_tools: list[dict] = []
 
@@ -262,56 +259,6 @@ class App:
         self._write_locks[type_name] = threading.Lock()
         self._mcp_tools = self._build_mcp_tools()
         self._flask_cached = None  # force Flask rebuild on next access
-        return self
-
-    def add_on_write_callback(self, data_type: type, on_write) -> "App":
-        """
-        Register a callback to be invoked after every successful write to *data_type*.
-
-        The callback is called once per write (upsert or delete) that completes
-        without error.  It is called **outside** the per-type write lock, so it
-        may safely call back into the app or perform I/O.
-
-        If the callback raises an exception the error is logged (respecting
-        ``Config.print_errors``) and the write result is returned normally — a
-        callback failure never causes the write to fail.
-
-        Multiple callbacks may be registered for the same data type; they are
-        called in registration order.
-
-        Args:
-            data_type: The registered dataclass class (e.g. ``Widget``).
-                       The type must already be registered via
-                       :meth:`add_data_type`.
-            on_write:  A callable with the signature
-                       ``(operation: str, key: str, data: dict | None) -> None``.
-
-                       * ``operation`` — ``"upsert"`` or ``"delete"``.
-                       * ``key``       — the item key.
-                       * ``data``      — the written data dict for upserts;
-                                        ``None`` for deletes.
-
-        Returns:
-            ``self``, enabling optional method chaining.
-
-        Raises:
-            KeyError: If *data_type* has not been registered via
-                      :meth:`add_data_type`.
-
-        Example::
-
-            def log_write(operation, key, data):
-                print(f"[{operation}] key={key} data={data}")
-
-            app.add_data_type(Widget)
-            app.add_on_write_callback(Widget, log_write)
-        """
-        type_name = data_type.__name__
-        if type_name not in self.data_types:
-            raise KeyError(
-                f"Data type '{type_name}' is not registered. Call add_data_type() first."
-            )
-        self._write_callbacks.setdefault(type_name, []).append(on_write)
         return self
 
     def add_operation(self, op_class: type[Operation]) -> "App":
@@ -885,7 +832,6 @@ class App:
                     errors.append(f"{backend.__class__.__name__}: {exc}")
             if errors:
                 raise RuntimeError("Upsert failed on one or more backends: " + "; ".join(errors))
-        self._fire_write_callbacks(type_name, "upsert", key, data)
         return {"key": key, "data": data}
 
     def _do_delete(self, type_name: str, key: str) -> dict:
@@ -901,7 +847,6 @@ class App:
                     errors.append(f"{backend.__class__.__name__}: {exc}")
             if errors:
                 raise RuntimeError("Delete failed on one or more backends: " + "; ".join(errors))
-        self._fire_write_callbacks(type_name, "delete", key, None)
         return {"deleted": existed, "key": key}
 
     def _do_get(self, type_name: str, key: str) -> Optional[dict]:
@@ -1024,21 +969,6 @@ class App:
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
-
-    def _fire_write_callbacks(
-        self, type_name: str, operation: str, key: str, data
-    ) -> None:
-        """Invoke all registered on_write callbacks for *type_name*.
-
-        Each callback receives ``(operation, key, data)``.  Exceptions are
-        caught, logged, and swallowed so that a misbehaving callback never
-        causes a write to appear to fail.
-        """
-        for cb in self._write_callbacks.get(type_name, []):
-            try:
-                cb(operation, key, data)
-            except Exception as exc:
-                self._log_error(f"on_write callback for '{type_name}'", exc)
 
     def _log_error(self, context: str, exc: Exception) -> None:
         if self.config.print_errors:
